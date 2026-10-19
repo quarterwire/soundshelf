@@ -94,11 +94,13 @@ pub fn log_path() -> Option<PathBuf> {
 
 const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 
+/// How many yt-dlp processes download at once.
+pub const PARALLEL: usize = 5;
+
 pub enum Event {
     Status(String),
-    /// (item, of) within a playlist.
-    Item(u32, u32),
-    Percent(f32),
+    /// Items finished (saved, already downloaded, or failed) out of the total.
+    Progress(u32, u32),
     Saved(String),
     Line(String),
     Finished(Result<(), String>),
@@ -195,101 +197,228 @@ fn run(
         return Ok(());
     }
     std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
-    let _ = tx.send(Event::Status("Starting…".into()));
+    let log = Log::create();
 
-    let template = dest.join("%(playlist_title,uploader|YouTube)s").join("%(title)s.%(ext)s");
-    let mut child = command(&ytdlp)
-        // Downloads go to .part files until complete, so a cancelled one never leaves a broken .m4a
-        // in the library (the scanner ignores .part).
-        .args(["-f", "bestaudio[ext=m4a]/bestaudio", "--ignore-errors", "--newline", "--color", "never"])
+    // 1. List the videos (fast: titles only, nothing downloaded yet).
+    let _ = tx.send(Event::Status("Reading playlist…".into()));
+    let entries = list_entries(&ytdlp, url, job, &log)?;
+    if cancelled.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    // 2. Split into batches: per output folder, round-robin across the workers.
+    let total = entries.len() as u32;
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for (video, folder) in entries {
+        match groups.iter_mut().find(|(f, _)| *f == folder) {
+            Some((_, urls)) => urls.push(video),
+            None => groups.push((folder, vec![video])),
+        }
+    }
+    let mut batches: Vec<(String, Vec<String>)> = Vec::new();
+    for (folder, urls) in groups {
+        let n = urls.len().min(PARALLEL);
+        let mut split: Vec<Vec<String>> = vec![Vec::new(); n];
+        for (i, u) in urls.into_iter().enumerate() {
+            split[i % n].push(u);
+        }
+        batches.extend(split.into_iter().map(|b| (folder.clone(), b)));
+    }
+    let workers = batches.len().min(PARALLEL);
+    let _ = tx.send(Event::Status(format!("Downloading · {workers} at a time")));
+    let _ = tx.send(Event::Progress(0, total));
+    ctx.request_repaint();
+
+    // 3. Run the batches, each in its own yt-dlp process, at most PARALLEL at once.
+    let queue = Mutex::new(batches.into_iter().enumerate().collect::<std::collections::VecDeque<_>>());
+    let done = std::sync::atomic::AtomicU32::new(0);
+    let failures = Mutex::new(Vec::<String>::new());
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let Some((n, (folder, urls))) = queue.lock().unwrap().pop_front() else { break };
+                    if cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let tick = || {
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        let _ = tx.send(Event::Progress(d.min(total), total));
+                        ctx.request_repaint();
+                    };
+                    if let Err(e) = download_batch(&ytdlp, dest, &folder, &urls, n, job, tx, &log, &tick, &failures) {
+                        failures.lock().unwrap().push(e);
+                    }
+                }
+            });
+        }
+    });
+
+    let failures = failures.into_inner().unwrap();
+    match failures.len() {
+        0 => Ok(()),
+        n => Err(format!("{n} of {total} failed — last: {}", failures.last().unwrap())),
+    }
+}
+
+/// The last run's full yt-dlp output, shared by all workers.
+#[derive(Clone)]
+struct Log(Arc<Mutex<Option<File>>>);
+
+impl Log {
+    fn create() -> Self {
+        Log(Arc::new(Mutex::new(log_path().and_then(|p| File::create(p).ok()))))
+    }
+
+    fn line(&self, worker: &str, line: &str) {
+        if let Some(f) = self.0.lock().unwrap().as_mut() {
+            let _ = writeln!(f, "[{worker}] {line}");
+        }
+    }
+}
+
+/// Spawns yt-dlp with our output conventions, inside the job.
+fn spawn(ytdlp: &Path, args: &[std::ffi::OsString], job: &Job) -> Result<Child, String> {
+    let child = command(ytdlp)
+        .args(["--ignore-errors", "--newline", "--color", "never"])
         // The frozen yt-dlp.exe ignores PYTHONUTF8 and would otherwise print in the ANSI code page.
         .args(["--encoding", "utf-8"])
-        // --print below implies --quiet, which would hide the progress and "item N of M" lines we parse.
-        .args(["--no-quiet", "--progress"])
-        // Skip anything already downloaded, so re-running a playlist only fetches new videos.
-        .arg("--download-archive")
-        .arg(dest.join(".soundshelf-archive.txt"))
-        .args(["--progress-template", "download:SSPROG %(progress._percent_str)s"])
-        .args(["--print", "after_move:SSSAVED %(filepath)s"])
-        .arg("-o")
-        .arg(template)
-        .arg(url)
+        .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("couldn't start yt-dlp: {e}"))?;
-
     job.adopt(&child);
-    let stdout = child.stdout.take().unwrap();
+    Ok(child)
+}
+
+/// Video URL + output folder name for every item behind `url` (one item for a plain video).
+fn list_entries(ytdlp: &Path, url: &str, job: &Job, log: &Log) -> Result<Vec<(String, String)>, String> {
+    let args: Vec<std::ffi::OsString> = vec![
+        "--flat-playlist".into(),
+        "--print".into(),
+        "%(webpage_url,url)s\t%(playlist_title,uploader,channel|YouTube)s".into(),
+        url.into(),
+    ];
+    let mut child = spawn(ytdlp, &args, job)?;
     let stderr = child.stderr.take().unwrap();
+    let err_log = log.clone();
+    let errs = std::thread::spawn(move || {
+        lines_lossy(stderr)
+            .inspect(|l| err_log.line("list", l))
+            .filter(|l| l.starts_with("ERROR"))
+            .collect::<Vec<_>>()
+    });
+    let entries: Vec<(String, String)> = lines_lossy(child.stdout.take().unwrap())
+        .inspect(|l| log.line("list", l))
+        .filter_map(|l| {
+            let (video, folder) = l.split_once('\t')?;
+            video.starts_with("http").then(|| (video.to_owned(), folder.to_owned()))
+        })
+        .collect();
+    let _ = child.wait();
+    let errs = errs.join().unwrap_or_default();
+    if entries.is_empty() {
+        return Err(errs.last().cloned().unwrap_or_else(|| "No videos found at that link".into()));
+    }
+    Ok(entries)
+}
 
-    // Full yt-dlp output, for troubleshooting failed downloads.
-    let log = Arc::new(Mutex::new(log_path().and_then(|p| File::create(p).ok())));
-    let write_log = {
-        let log = log.clone();
-        move |line: &str| {
-            if let Some(f) = log.lock().unwrap().as_mut() {
-                let _ = writeln!(f, "{line}");
-            }
-        }
-    };
+/// Makes a playlist/channel title safe as a Windows folder name inside an output template.
+fn folder_name(title: &str) -> String {
+    let mut s: String = title
+        .chars()
+        .map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .take(100)
+        .collect();
+    while s.ends_with(['.', ' ']) {
+        s.pop();
+    }
+    if s.trim().is_empty() || s == "NA" {
+        s = "YouTube".into();
+    }
+    // `%` is the template escape character.
+    s.replace('%', "%%")
+}
 
-    let err_tx = tx.clone();
-    let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
-    let err_keep = err_lines.clone();
-    let err_log = write_log.clone();
-    let err_thread = std::thread::spawn(move || {
-        for line in lines_lossy(stderr) {
-            err_log(&line);
-            if line.starts_with("ERROR") {
-                err_keep.lock().unwrap().push(line.clone());
+#[allow(clippy::too_many_arguments)]
+fn download_batch(
+    ytdlp: &Path,
+    dest: &Path,
+    folder: &str,
+    urls: &[String],
+    n: usize,
+    job: &Job,
+    tx: &Sender<Event>,
+    log: &Log,
+    tick: &(dyn Fn() + Sync),
+    failures: &Mutex<Vec<String>>,
+) -> Result<(), String> {
+    let batch_file = std::env::temp_dir().join(format!("soundshelf-batch-{}-{n}.txt", std::process::id()));
+    std::fs::write(&batch_file, urls.join("\n")).map_err(|e| e.to_string())?;
+    let template = dest.join(folder_name(folder)).join("%(title)s.%(ext)s");
+    let args: Vec<std::ffi::OsString> = vec![
+        "-f".into(),
+        "bestaudio[ext=m4a]/bestaudio".into(),
+        // Skip anything already downloaded, so re-running a playlist only fetches new videos.
+        // yt-dlp locks the archive file, so the parallel workers can share it.
+        "--download-archive".into(),
+        dest.join(".soundshelf-archive.txt").into(),
+        "--print".into(),
+        "after_move:SSSAVED %(filepath)s".into(),
+        // --print implies --quiet; keep the normal output for the log and the "already downloaded" lines.
+        "--no-quiet".into(),
+        "-o".into(),
+        template.into(),
+        "-a".into(),
+        batch_file.clone().into(),
+    ];
+    let mut child = spawn(ytdlp, &args, job)?;
+    let worker = format!("w{n}");
+
+    let stderr = child.stderr.take().unwrap();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for line in lines_lossy(stderr) {
+                log.line(&worker, &line);
+                // A failed video prints "ERROR: Unable to download video: X" and then "ERROR: X";
+                // count each failure once.
+                if line.starts_with("ERROR") && !line.starts_with("ERROR: Unable to download video") {
+                    failures.lock().unwrap().push(line.clone());
+                    tick();
+                }
+                if !line.starts_with("WARNING") {
+                    let _ = tx.send(Event::Line(line));
+                }
             }
-            if !line.starts_with("WARNING") {
-                let _ = err_tx.send(Event::Line(line));
+        });
+        for line in lines_lossy(child.stdout.take().unwrap()) {
+            log.line(&worker, &line);
+            if let Some(path) = line.strip_prefix("SSSAVED ") {
+                let _ = tx.send(Event::Saved(path.trim().to_owned()));
+                tick();
+            } else if line.contains("has already been recorded in the archive") {
+                tick();
             }
         }
     });
-
-    for line in lines_lossy(stdout) {
-        if !line.starts_with("SSPROG") {
-            write_log(&line);
-        }
-        if let Some(p) = line.strip_prefix("SSPROG") {
-            if let Ok(v) = p.trim().trim_end_matches('%').trim().parse::<f32>() {
-                let _ = tx.send(Event::Percent(v));
-            }
-        } else if let Some(path) = line.strip_prefix("SSSAVED ") {
-            let _ = tx.send(Event::Saved(path.trim().to_owned()));
-        } else if let Some(rest) = line.strip_prefix("[download] Downloading item ") {
-            // "[download] Downloading item 3 of 25"
-            let mut nums = rest.split(" of ").filter_map(|n| n.trim().parse::<u32>().ok());
-            if let (Some(a), Some(b)) = (nums.next(), nums.next()) {
-                let _ = tx.send(Event::Item(a, b));
-            }
-        } else {
-            let _ = tx.send(Event::Line(line));
-        }
-        ctx.request_repaint();
-    }
-    let _ = err_thread.join();
-
-    match child.wait() {
-        Ok(s) if s.success() => Ok(()),
-        // With --ignore-errors yt-dlp exits 1 if some videos failed (private, removed…).
-        Ok(_) => {
-            let errs = err_lines.lock().unwrap();
-            match errs.len() {
-                0 => Err("yt-dlp reported an error".into()),
-                n => Err(format!("{n} item(s) failed — last: {}", errs.last().unwrap())),
-            }
-        }
-        Err(e) => Err(e.to_string()),
-    }
+    let _ = child.wait();
+    let _ = std::fs::remove_file(&batch_file);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_names_are_windows_safe() {
+        assert_eq!(folder_name("Undertale and Deltarune Battle Themes"), "Undertale and Deltarune Battle Themes");
+        assert_eq!(folder_name("Best of: 2024 / 2025?"), "Best of_ 2024 _ 2025_");
+        assert_eq!(folder_name("100% Hype..."), "100%% Hype");
+        assert_eq!(folder_name("NA"), "YouTube");
+        assert_eq!(folder_name("  "), "YouTube");
+    }
 
     /// Network test: `cargo test -- --ignored ytdl` with SS_YT_TEST_DIR set to a scratch folder.
     #[test]
@@ -306,7 +435,7 @@ mod tests {
                     break;
                 }
                 Event::Status(s) => eprintln!("status: {s}"),
-                Event::Item(..) | Event::Percent(_) | Event::Line(_) => {}
+                Event::Progress(..) | Event::Line(_) => {}
             }
         }
         assert_eq!(saved.len(), 1, "{saved:?}");

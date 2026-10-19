@@ -2,13 +2,17 @@
 
 A fast, lightweight audio library for songs and sound effects. Add your folders once, and every sound in every subfolder shows up in one searchable list. Click to preview, then drag rows straight into Premiere (or any other editor, or Explorer).
 
+## Download
+
+Grab the latest `SoundShelf-…-windows-x64.exe` from [Releases](https://github.com/quarterwire/soundshelf/releases) and run it. It's a single 9 MB file with no installer, for Windows 10/11, 64-bit.
+
 ## Build
 
-```
+```powershell
 cargo build --release
 ```
 
-The binary is at `target\release\soundshelf.exe`, a single 8 MB file with no installer.
+The binary is at `target\release\soundshelf.exe`.
 
 ## Use
 
@@ -24,6 +28,7 @@ The binary is at `target\release\soundshelf.exe`, a single 8 MB file with no ins
 
 **Download from YouTube** (top bar) takes a video or playlist link and saves the audio as `.m4a`, in one folder per playlist, inside your download folder. The download folder defaults to `<first library folder>\YouTube`, and you can change it with **Change…**. New files appear in the library when the download finishes.
 
+- Playlists download 5 videos at a time. A 75-track playlist takes about 30 seconds.
 - Videos already downloaded are skipped, so running the same playlist again only grabs new uploads.
 - SoundShelf uses [yt-dlp](https://github.com/yt-dlp/yt-dlp). On first use it downloads `yt-dlp.exe` into `%APPDATA%\SoundShelf\bin` and updates it before each run. ffmpeg isn't needed.
 - Only download audio you have the rights to use, such as your own uploads or royalty-free and Creative Commons music.

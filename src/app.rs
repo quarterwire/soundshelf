@@ -20,8 +20,8 @@ struct DlState {
     url: String,
     job: Option<Download>,
     status: String,
+    /// Finished items and total, once the playlist has been read.
     item: Option<(u32, u32)>,
-    percent: f32,
     saved: u32,
     last_line: String,
     result: Option<Result<(), String>>,
@@ -969,14 +969,7 @@ impl App {
         for ev in events {
             match ev {
                 ytdl::Event::Status(s) => self.dl.status = s,
-                ytdl::Event::Item(a, b) => {
-                    self.dl.item = Some((a, b));
-                    self.dl.percent = 0.0;
-                }
-                ytdl::Event::Percent(p) => {
-                    self.dl.percent = p;
-                    self.dl.status = "Downloading".into();
-                }
+                ytdl::Event::Progress(done, total) => self.dl.item = Some((done, total)),
                 ytdl::Event::Saved(path) => {
                     self.dl.saved += 1;
                     let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned());
@@ -1052,12 +1045,16 @@ impl App {
             ui.add_space(6.0);
 
             if running {
-                let mut status = self.dl.status.clone();
-                if let Some((a, b)) = self.dl.item {
-                    status = format!("{status}  ·  item {a} of {b}");
+                ui.label(&self.dl.status);
+                match self.dl.item {
+                    Some((done, total)) => {
+                        let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+                        ui.add(egui::ProgressBar::new(frac).text(format!("{done} of {total}")));
+                    }
+                    None => {
+                        ui.add(egui::ProgressBar::new(0.0).animate(true));
+                    }
                 }
-                ui.label(status);
-                ui.add(egui::ProgressBar::new(self.dl.percent / 100.0).show_percentage());
                 if self.dl.saved > 0 {
                     ui.label(RichText::new(format!("{} saved so far", self.dl.saved)).small().color(DIM));
                 }
