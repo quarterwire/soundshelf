@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -49,6 +49,7 @@ enum SortKey {
     Folder,
     Loudness,
     Length,
+    Kind,
     Type,
     Size,
 }
@@ -60,6 +61,17 @@ enum Kind {
     Music,
 }
 
+/// Whether an entry is SFX, and whether that came from a manual mark (file or folder)
+/// rather than the length rule. `None` while the length is still unknown.
+fn classify(marks: &HashMap<PathBuf, bool>, e: &Entry) -> Option<(bool, bool)> {
+    if !marks.is_empty()
+        && let Some(&is_sfx) = e.path.ancestors().find_map(|p| marks.get(p))
+    {
+        return Some((is_sfx, true));
+    }
+    e.duration.map(|d| (d < SFX_MAX_SECS, false))
+}
+
 enum Action {
     Click(usize, Modifiers),
     Play(usize),
@@ -68,6 +80,9 @@ enum Action {
     CopyFiles(usize),
     CopyPath(usize),
     SetFolder(Option<PathBuf>),
+    /// Mark the selection containing this row: Some(true) SFX, Some(false) Music, None clear.
+    MarkFiles(usize, Option<bool>),
+    MarkFolder(PathBuf, Option<bool>),
     Sort(SortKey),
     AddRoot,
     RemoveRoot(PathBuf),
@@ -111,6 +126,8 @@ pub struct App {
     analyzer: Analyzer,
     cache: Cache,
     dl: DlState,
+    /// Manual SFX (true) / Music (false) marks on files or folders.
+    marks: HashMap<PathBuf, bool>,
     /// Set after an OS drag: the button-up went to the drop target, so egui never saw it.
     release_pointer: bool,
     message: Option<String>,
@@ -150,6 +167,7 @@ impl App {
             analyzer: Analyzer::new(cc.egui_ctx.clone()),
             cache: Cache::load(),
             dl: DlState::default(),
+            marks: crate::config::load_marks(),
             release_pointer: false,
             message: None,
         };
@@ -260,6 +278,7 @@ impl App {
         self.view_dirty = false;
         let terms: Vec<String> = self.search.to_lowercase().split_whitespace().map(str::to_owned).collect();
         let entries = &self.entries;
+        let marks = &self.marks;
         self.view = (0..entries.len())
             .filter(|&i| {
                 let e = &entries[i];
@@ -270,8 +289,8 @@ impl App {
                 }
                 let kind_ok = match self.kind {
                     Kind::All => true,
-                    Kind::Sfx => e.duration.is_some_and(|d| d < SFX_MAX_SECS),
-                    Kind::Music => e.duration.is_some_and(|d| d >= SFX_MAX_SECS),
+                    Kind::Sfx => classify(marks, e).is_some_and(|(sfx, _)| sfx),
+                    Kind::Music => classify(marks, e).is_some_and(|(sfx, _)| !sfx),
                 };
                 kind_ok && terms.iter().all(|t| e.haystack.contains(t.as_str()))
             })
@@ -283,6 +302,9 @@ impl App {
             }
             SortKey::Type => self.view.sort_by_cached_key(|&i| (entries[i].ext.clone(), entries[i].name.to_lowercase())),
             SortKey::Size => self.view.sort_by_key(|&i| entries[i].size),
+            SortKey::Kind => self.view.sort_by_cached_key(|&i| {
+                (classify(marks, &entries[i]).map(|(sfx, _)| !sfx), entries[i].name.to_lowercase())
+            }),
             SortKey::Loudness => self.view.sort_by(|&a, &b| {
                 let key = |i: usize| entries[i].loudness.map(|l| l.0).filter(|l| l.is_finite()).unwrap_or(f32::MIN);
                 key(a).total_cmp(&key(b))
@@ -406,6 +428,18 @@ impl App {
                 self.folder = f;
                 self.view_dirty = true;
             }
+            Action::MarkFiles(idx, mark) => {
+                for path in self.targets(idx) {
+                    self.set_mark(path, mark);
+                }
+                crate::config::save_marks(&self.marks);
+                self.view_dirty = true;
+            }
+            Action::MarkFolder(path, mark) => {
+                self.set_mark(path, mark);
+                crate::config::save_marks(&self.marks);
+                self.view_dirty = true;
+            }
             Action::Sort(key) => {
                 if self.sort == key {
                     self.sort_desc = !self.sort_desc;
@@ -446,6 +480,17 @@ impl App {
         }
     }
 
+    fn set_mark(&mut self, path: PathBuf, mark: Option<bool>) {
+        match mark {
+            Some(is_sfx) => {
+                self.marks.insert(path, is_sfx);
+            }
+            None => {
+                self.marks.remove(&path);
+            }
+        }
+    }
+
     fn add_roots(&mut self, ctx: &egui::Context, dirs: Vec<PathBuf>) {
         for dir in dirs.into_iter().filter(|d| d.is_dir()) {
             // Skip folders already covered by an existing root; drop roots the new one covers.
@@ -461,6 +506,11 @@ impl App {
 
     fn handle_keys(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
         let search_focused = ctx.memory(|m| m.has_focus(self.search_id));
+        // Another text field (e.g. the download URL box) owns the keyboard: leave all
+        // keys, text, copy and paste events to it instead of treating them as shortcuts.
+        if !search_focused && ctx.text_edit_focused() {
+            return;
+        }
         let (mut nav, mut extend) = (None::<isize>, false);
         let page = 20isize;
         ctx.input_mut(|i| {
@@ -629,7 +679,7 @@ impl App {
             }
             ui.add_space(2.0);
             for &id in &self.tree_top {
-                tree_ui(ui, &self.tree, id, &self.folder, actions, true);
+                tree_ui(ui, &self.tree, id, &self.folder, &self.marks, actions, true);
             }
         });
     }
@@ -663,6 +713,7 @@ impl App {
             (SortKey::Folder, "Folder", false),
             (SortKey::Loudness, "LUFS", true),
             (SortKey::Length, "Length", true),
+            (SortKey::Kind, "Kind", false),
             (SortKey::Type, "Type", false),
             (SortKey::Size, "Size", true),
         ]
@@ -749,8 +800,12 @@ impl App {
                 }
                 let len = e.duration.map(fmt_duration).unwrap_or_default();
                 cell_text(painter, cols[3], &len, DIM, true);
-                cell_text(painter, cols[4], &e.ext.to_uppercase(), DIM, false);
-                cell_text(painter, cols[5], &fmt_size(e.size), DIM, true);
+                if let Some((sfx, manual)) = classify(&self.marks, e) {
+                    // Manual marks are highlighted so you can tell them from the length rule.
+                    cell_text(painter, cols[4], if sfx { "SFX" } else { "Music" }, if manual { ACCENT } else { DIM }, false);
+                }
+                cell_text(painter, cols[5], &e.ext.to_uppercase(), DIM, false);
+                cell_text(painter, cols[6], &fmt_size(e.size), DIM, true);
 
                 if resp.drag_started_by(egui::PointerButton::Primary) {
                     actions.push(Action::Drag(idx));
@@ -772,6 +827,8 @@ impl App {
                     if ui.button("📂  Show in Explorer").clicked() {
                         actions.push(Action::Reveal(e.path.clone()));
                     }
+                    ui.separator();
+                    mark_menu(ui, self.marks.get(&e.path).copied(), |m| actions.push(Action::MarkFiles(idx, m)));
                 });
 
                 if self.scroll_to_cursor && cursor_pos == Some(pos) {
@@ -947,12 +1004,21 @@ impl App {
         egui::Window::new("Download from YouTube").open(&mut open).default_width(540.0).collapsible(false).show(ctx, |ui| {
             ui.label("Paste a YouTube video or playlist link. Audio is saved as .m4a, one folder per playlist.");
             ui.add_space(4.0);
-            let edit = ui.add_enabled(
-                !running,
-                egui::TextEdit::singleline(&mut self.dl.url)
-                    .hint_text("https://www.youtube.com/playlist?list=…")
-                    .desired_width(f32::INFINITY),
-            );
+            let edit = ui
+                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_enabled(!running, egui::Button::new("Paste")).on_hover_text("Paste link from clipboard").clicked()
+                        && let Some(text) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok())
+                    {
+                        self.dl.url = text.trim().to_owned();
+                    }
+                    ui.add_enabled(
+                        !running,
+                        egui::TextEdit::singleline(&mut self.dl.url)
+                            .hint_text("https://www.youtube.com/playlist?list=…")
+                            .desired_width(f32::INFINITY),
+                    )
+                })
+                .inner;
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Save to").color(DIM));
@@ -1130,7 +1196,15 @@ impl eframe::App for App {
     }
 }
 
-fn tree_ui(ui: &mut egui::Ui, nodes: &[DirNode], id: usize, selected: &Option<PathBuf>, actions: &mut Vec<Action>, is_root: bool) {
+fn tree_ui(
+    ui: &mut egui::Ui,
+    nodes: &[DirNode],
+    id: usize,
+    selected: &Option<PathBuf>,
+    marks: &HashMap<PathBuf, bool>,
+    actions: &mut Vec<Action>,
+    is_root: bool,
+) {
     let node = &nodes[id];
     let is_sel = selected.as_ref() == Some(&node.path);
     let mut job = LayoutJob::default();
@@ -1138,6 +1212,10 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[DirNode], id: usize, selected: &Option<Pa
     let dim = egui::TextFormat { font_id: FontId::proportional(11.5), color: DIM, ..Default::default() };
     job.append(&node.name, 0.0, normal);
     job.append(&node.count.to_string(), 8.0, dim);
+    if let Some(&is_sfx) = marks.get(&node.path) {
+        let tag = egui::TextFormat { font_id: FontId::proportional(11.0), color: ACCENT, ..Default::default() };
+        job.append(if is_sfx { "SFX" } else { "Music" }, 8.0, tag);
+    }
 
     let mut label = |ui: &mut egui::Ui| {
         let resp = ui.add(egui::Button::selectable(is_sel, job.clone()).wrap_mode(TextWrapMode::Truncate));
@@ -1148,8 +1226,14 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[DirNode], id: usize, selected: &Option<Pa
             if ui.button("📂  Show in Explorer").clicked() {
                 actions.push(Action::Reveal(node.path.clone()));
             }
-            if is_root && ui.button("Remove from library").clicked() {
-                actions.push(Action::RemoveRoot(node.path.clone()));
+            ui.separator();
+            ui.label(RichText::new("Everything in this folder:").small().color(DIM));
+            mark_menu(ui, marks.get(&node.path).copied(), |m| actions.push(Action::MarkFolder(node.path.clone(), m)));
+            if is_root {
+                ui.separator();
+                if ui.button("Remove from library").clicked() {
+                    actions.push(Action::RemoveRoot(node.path.clone()));
+                }
             }
         });
     };
@@ -1163,19 +1247,32 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[DirNode], id: usize, selected: &Option<Pa
         let state = CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id(&node.path), is_root);
         state.show_header(ui, |ui| label(ui)).body(|ui| {
             for &c in &node.children {
-                tree_ui(ui, nodes, c, selected, actions, false);
+                tree_ui(ui, nodes, c, selected, marks, actions, false);
             }
         });
     }
 }
 
-/// Column rects for a row: Name | Folder | LUFS | Length | Type | Size.
-fn columns(row: Rect) -> [Rect; 6] {
+/// "Mark as SFX / Music / Reset" items; `current` is the existing mark on exactly this path.
+fn mark_menu(ui: &mut egui::Ui, current: Option<bool>, mut set: impl FnMut(Option<bool>)) {
+    if ui.add(egui::Button::selectable(current == Some(true), "Mark as SFX")).clicked() {
+        set(Some(true));
+    }
+    if ui.add(egui::Button::selectable(current == Some(false), "Mark as Music")).clicked() {
+        set(Some(false));
+    }
+    if current.is_some() && ui.button("Clear mark").clicked() {
+        set(None);
+    }
+}
+
+/// Column rects for a row: Name | Folder | LUFS | Length | Kind | Type | Size.
+fn columns(row: Rect) -> [Rect; 7] {
     const PAD: f32 = 10.0;
-    let fixed = [56.0, 64.0, 52.0, 74.0];
+    let fixed = [56.0, 64.0, 48.0, 52.0, 74.0];
     let x0 = row.left() + 6.0;
-    let flex = (row.right() - 6.0 - x0 - fixed.iter().sum::<f32>() - PAD * 5.0).max(120.0);
-    let widths = [flex * 0.55, flex * 0.45, fixed[0], fixed[1], fixed[2], fixed[3]];
+    let flex = (row.right() - 6.0 - x0 - fixed.iter().sum::<f32>() - PAD * 6.0).max(120.0);
+    let widths = [flex * 0.55, flex * 0.45, fixed[0], fixed[1], fixed[2], fixed[3], fixed[4]];
     let mut x = x0;
     widths.map(|w| {
         let r = Rect::from_min_max(egui::pos2(x, row.top()), egui::pos2(x + w, row.bottom()));
@@ -1278,4 +1375,45 @@ fn setup_style(ctx: &egui::Context) {
         s.spacing.button_padding = Vec2::new(8.0, 3.0);
         s.spacing.item_spacing = Vec2::new(6.0, 4.0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(path: &str, secs: Option<f32>) -> Entry {
+        let path = PathBuf::from(path);
+        Entry {
+            name: String::new(),
+            dir: path.parent().unwrap().to_path_buf(),
+            path,
+            folder: String::new(),
+            ext: "wav".into(),
+            size: 0,
+            mtime: 0,
+            duration: secs,
+            loudness: None,
+            haystack: String::new(),
+        }
+    }
+
+    #[test]
+    fn marks_override_length_rule() {
+        let mut marks = HashMap::new();
+        let short = entry(r"C:\lib\Songs\Intro\sting.wav", Some(4.0));
+        let long = entry(r"C:\lib\Songs\Intro\theme.wav", Some(95.0));
+        assert_eq!(classify(&marks, &short), Some((true, false)));
+        assert_eq!(classify(&marks, &long), Some((false, false)));
+        assert_eq!(classify(&marks, &entry(r"C:\lib\x.wav", None)), None);
+
+        // Folder mark applies to everything below it, even before the length is known.
+        marks.insert(PathBuf::from(r"C:\lib\Songs"), false);
+        assert_eq!(classify(&marks, &short), Some((false, true)));
+        assert_eq!(classify(&marks, &entry(r"C:\lib\Songs\y.wav", None)), Some((false, true)));
+
+        // A file mark beats the folder mark.
+        marks.insert(short.path.clone(), true);
+        assert_eq!(classify(&marks, &short), Some((true, true)));
+        assert_eq!(classify(&marks, &long), Some((false, true)));
+    }
 }

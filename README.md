@@ -18,7 +18,7 @@ The binary is at `target\release\soundshelf.exe`, a single 8 MB file with no ins
 - **Drag** one row, or a Ctrl/Shift multi-selection, into Premiere's timeline or Project panel.
 - **Ctrl+C** copies the files themselves, the same as Explorer does.
 - **Space** play/pause · **Left/Right** seek 5 s · **Esc** stop or clear search · **F5** rescan
-- **SFX / Music** split clips at 30 seconds.
+- **SFX / Music** split clips at 30 seconds. If one is wrong, right-click it (or a multi-selection) and choose **Mark as SFX** or **Mark as Music**. Right-click a folder in the tree to mark everything in it. File marks beat folder marks, and folder marks beat the 30-second rule. Manual marks show highlighted in the **Kind** column and are saved in `%APPDATA%\SoundShelf\marks.txt`.
 
 ## YouTube downloads
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Plain `key=value` lines in %APPDATA%\SoundShelf\config.txt — no serde needed.
@@ -14,9 +15,39 @@ impl Default for Config {
     }
 }
 
-fn path() -> Option<PathBuf> {
+fn dir() -> Option<PathBuf> {
     let base = std::env::var_os("APPDATA").or_else(|| std::env::var_os("XDG_CONFIG_HOME"))?;
-    Some(PathBuf::from(base).join("SoundShelf").join("config.txt"))
+    Some(PathBuf::from(base).join("SoundShelf"))
+}
+
+fn path() -> Option<PathBuf> {
+    Some(dir()?.join("config.txt"))
+}
+
+/// Manual SFX/Music marks, one `sfx<TAB>path` or `music<TAB>path` per line. Paths may be files or folders.
+pub fn load_marks() -> HashMap<PathBuf, bool> {
+    let Some(text) = dir().and_then(|d| std::fs::read_to_string(d.join("marks.txt")).ok()) else {
+        return HashMap::new();
+    };
+    text.lines()
+        .filter_map(|l| {
+            let (kind, path) = l.split_once('\t')?;
+            Some((PathBuf::from(path), kind == "sfx"))
+        })
+        .collect()
+}
+
+/// `is_sfx` per path: true = SFX, false = Music.
+pub fn save_marks(marks: &HashMap<PathBuf, bool>) {
+    let Some(dir) = dir() else { return };
+    let mut out = String::new();
+    for (path, is_sfx) in marks {
+        out.push_str(if *is_sfx { "sfx\t" } else { "music\t" });
+        out.push_str(&path.display().to_string());
+        out.push('\n');
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::write(dir.join("marks.txt"), out);
 }
 
 impl Config {
