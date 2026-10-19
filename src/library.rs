@@ -16,7 +16,11 @@ pub struct Entry {
     pub folder: String,
     pub ext: String,
     pub size: u64,
+    /// Modified time (secs since epoch), used to invalidate cached analysis.
+    pub mtime: u64,
     pub duration: Option<f32>,
+    /// Integrated LUFS and sample peak dBFS once analyzed; NaN lufs means analysis failed.
+    pub loudness: Option<(f32, f32)>,
     /// Lowercased `name` + `folder`, for searching.
     pub haystack: String,
 }
@@ -82,7 +86,14 @@ impl Scanner {
                     if !AUDIO_EXTS.contains(&ext.as_str()) {
                         continue;
                     }
-                    entries.push(make_entry(root, path, ext, item.metadata().map(|m| m.len()).unwrap_or(0)));
+                    let meta = item.metadata().ok();
+                    let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let mtime = meta
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    entries.push(make_entry(root, path, ext, size, mtime));
                     if found.fetch_add(1, Ordering::Relaxed) % 500 == 0 {
                         ctx.request_repaint();
                     }
@@ -97,7 +108,7 @@ impl Scanner {
     }
 }
 
-fn make_entry(root: &Path, path: &Path, ext: String, size: u64) -> Entry {
+fn make_entry(root: &Path, path: &Path, ext: String, size: u64, mtime: u64) -> Entry {
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let root_name = root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
@@ -107,7 +118,7 @@ fn make_entry(root: &Path, path: &Path, ext: String, size: u64) -> Entry {
         Err(_) => dir.display().to_string(),
     };
     let haystack = format!("{} {}", name, folder).to_lowercase();
-    Entry { path: path.to_path_buf(), name, dir, folder, ext, size, duration: None, haystack }
+    Entry { path: path.to_path_buf(), name, dir, folder, ext, size, mtime, duration: None, loudness: None, haystack }
 }
 
 fn probe_all(

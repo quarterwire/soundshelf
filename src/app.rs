@@ -7,6 +7,7 @@ use eframe::egui::{
     Vec2, collapsing_header::CollapsingState, text::LayoutJob,
 };
 
+use crate::analysis::{self, Analyzer, BED_TARGET, Cache, Job, YT_TARGET, fmt_db};
 use crate::audio::Audio;
 use crate::config::Config;
 use crate::dragout;
@@ -24,11 +25,15 @@ const SELECTED: Color32 = Color32::from_rgb(38, 64, 108);
 const ACCENT: Color32 = Color32::from_rgb(98, 160, 255);
 const TEXT: Color32 = Color32::from_rgb(222, 224, 228);
 const DIM: Color32 = Color32::from_rgb(140, 144, 152);
+const WARN: Color32 = Color32::from_rgb(240, 180, 90);
+const HOT: Color32 = Color32::from_rgb(240, 100, 90);
+const GOOD: Color32 = Color32::from_rgb(120, 200, 140);
 
 #[derive(Clone, Copy, PartialEq)]
 enum SortKey {
     Name,
     Folder,
+    Loudness,
     Length,
     Type,
     Size,
@@ -86,7 +91,11 @@ pub struct App {
     search_id: egui::Id,
 
     audio: Audio,
+    /// Entry index of the file loaded in the player.
+    playing_idx: Option<usize>,
     seek_drag: Option<f32>,
+    analyzer: Analyzer,
+    cache: Cache,
     /// Set after an OS drag: the button-up went to the drop target, so egui never saw it.
     release_pointer: bool,
     message: Option<String>,
@@ -121,7 +130,10 @@ impl App {
             focus_search: false,
             search_id: egui::Id::unique("search"),
             audio,
+            playing_idx: None,
             seek_drag: None,
+            analyzer: Analyzer::new(cc.egui_ctx.clone()),
+            cache: Cache::load(),
             release_pointer: false,
             message: None,
         };
@@ -150,10 +162,22 @@ impl App {
                     // Keep the selection/cursor across rescans by path.
                     let keep: HashSet<PathBuf> = self.selected.iter().map(|&i| self.entries[i].path.clone()).collect();
                     let cursor = self.cursor.map(|i| self.entries[i].path.clone());
+                    let playing = self.playing_idx.map(|i| self.entries[i].path.clone());
                     self.entries = entries;
                     (self.tree, self.tree_top) = library::build_tree(&self.cfg.roots, &self.entries);
                     self.selected = (0..self.entries.len()).filter(|&i| keep.contains(&self.entries[i].path)).collect();
                     self.cursor = cursor.and_then(|p| self.entries.iter().position(|e| e.path == p));
+                    self.playing_idx = playing.and_then(|p| self.entries.iter().position(|e| e.path == p));
+
+                    // Fill loudness from the cache; queue everything else for background analysis.
+                    let mut jobs = Vec::new();
+                    for (idx, e) in self.entries.iter_mut().enumerate() {
+                        match self.cache.get(&e.path, e.size, e.mtime) {
+                            Some(a) => e.loudness = Some((a.lufs, a.peak_db)),
+                            None => jobs.push(Job { generation, idx, path: e.path.clone() }),
+                        }
+                    }
+                    self.analyzer.set_jobs(jobs);
                     self.anchor = self.cursor;
                     if let Some(f) = &self.folder
                         && !self.tree.iter().any(|n| &n.path == f)
@@ -182,6 +206,37 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        let mut got = false;
+        while let Ok(done) = self.analyzer.rx.try_recv() {
+            if done.generation != self.generation {
+                continue;
+            }
+            let Some(e) = self.entries.get_mut(done.idx) else { continue };
+            got = true;
+            match done.analysis {
+                Some(a) => {
+                    e.loudness = Some((a.lufs, a.peak_db));
+                    self.cache.insert(e.path.clone(), e.size, e.mtime, a);
+                }
+                None => e.loudness = Some((f32::NAN, f32::NAN)),
+            }
+        }
+        if got {
+            self.cache.flush();
+            if self.sort == SortKey::Loudness && self.analyzer.pending() == 0 {
+                self.view_dirty = true;
+            }
+        }
+    }
+
+    /// Makes sure the file gets analyzed soon if it hasn't been yet.
+    fn want_analysis(&self, idx: usize) {
+        if let Some(e) = self.entries.get(idx)
+            && e.loudness.is_none()
+        {
+            self.analyzer.prioritize(Job { generation: self.generation, idx, path: e.path.clone() });
         }
     }
 
@@ -212,6 +267,10 @@ impl App {
             }
             SortKey::Type => self.view.sort_by_cached_key(|&i| (entries[i].ext.clone(), entries[i].name.to_lowercase())),
             SortKey::Size => self.view.sort_by_key(|&i| entries[i].size),
+            SortKey::Loudness => self.view.sort_by(|&a, &b| {
+                let key = |i: usize| entries[i].loudness.map(|l| l.0).filter(|l| l.is_finite()).unwrap_or(f32::MIN);
+                key(a).total_cmp(&key(b))
+            }),
             SortKey::Length => self.view.sort_by(|&a, &b| {
                 let (a, b) = (entries[a].duration.unwrap_or(f32::MAX), entries[b].duration.unwrap_or(f32::MAX));
                 a.total_cmp(&b)
@@ -229,6 +288,8 @@ impl App {
 
     fn play(&mut self, idx: usize) {
         let Some(e) = self.entries.get(idx) else { return };
+        self.playing_idx = Some(idx);
+        self.want_analysis(idx);
         match self.audio.play(&e.path) {
             Ok(()) => self.message = None,
             Err(err) => self.message = Some(format!("Can't play {}: {err}", e.name)),
@@ -247,6 +308,7 @@ impl App {
         }
         self.cursor = Some(idx);
         self.scroll_to_cursor = true;
+        self.want_analysis(idx);
         if self.cfg.autoplay && !extend {
             self.play(idx);
         }
@@ -276,6 +338,7 @@ impl App {
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::Click(idx, mods) => {
+                self.want_analysis(idx);
                 let pos = self.view.iter().position(|&i| i == idx);
                 if mods.command {
                     if !self.selected.remove(&idx) {
@@ -578,6 +641,7 @@ impl App {
         for (i, (key, title, right)) in [
             (SortKey::Name, "Name", false),
             (SortKey::Folder, "Folder", false),
+            (SortKey::Loudness, "LUFS", true),
             (SortKey::Length, "Length", true),
             (SortKey::Type, "Type", false),
             (SortKey::Size, "Size", true),
@@ -659,10 +723,14 @@ impl App {
                 }
                 cell_text(painter, name_cell, &e.name, name_color, false);
                 cell_text(painter, cols[1], &e.folder, DIM, false);
+                if let Some((lufs, _)) = e.loudness {
+                    let (text, color) = loudness_label(lufs);
+                    cell_text(painter, cols[2], &text, color, true);
+                }
                 let len = e.duration.map(fmt_duration).unwrap_or_default();
-                cell_text(painter, cols[2], &len, DIM, true);
-                cell_text(painter, cols[3], &e.ext.to_uppercase(), DIM, false);
-                cell_text(painter, cols[4], &fmt_size(e.size), DIM, true);
+                cell_text(painter, cols[3], &len, DIM, true);
+                cell_text(painter, cols[4], &e.ext.to_uppercase(), DIM, false);
+                cell_text(painter, cols[5], &fmt_size(e.size), DIM, true);
 
                 if resp.drag_started_by(egui::PointerButton::Primary) {
                     actions.push(Action::Drag(idx));
@@ -703,6 +771,50 @@ impl App {
     }
 
     fn ui_player(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        // Show the playing file, or the selected one when nothing is playing.
+        let live = self.audio.current.is_some();
+        let shown = if live { self.playing_idx } else { self.cursor };
+        let entry = shown.and_then(|i| self.entries.get(i));
+        let wave = entry.and_then(|e| self.cache.get(&e.path, e.size, e.mtime)).map(|a| a.wave.clone());
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let title = entry.map(|e| e.name.clone()).unwrap_or_else(|| "Nothing selected".into());
+            ui.label(RichText::new(title).color(if entry.is_some() { TEXT } else { DIM }).strong());
+            let Some(e) = entry else { return };
+            match e.loudness {
+                None => {
+                    ui.label(RichText::new("measuring loudness…").color(DIM));
+                }
+                Some((lufs, _)) if lufs.is_nan() => {
+                    ui.label(RichText::new("couldn't measure this format").color(DIM));
+                }
+                Some((lufs, peak)) => {
+                    let (text, color) = loudness_label(lufs);
+                    ui.label(RichText::new(format!("{text} LUFS")).color(color).strong());
+                    ui.label(RichText::new(format!("peak {:.1} dBFS", peak)).color(DIM));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Right-to-left layout: this reads "YouTube … Under voice …" on screen.
+                        let help = "Gain to apply in Premiere: select the clip(s) → Audio Gain (G) → Adjust Gain by.\n\
+                                    YouTube plays everything at about -14 LUFS, so louder uploads get turned down.\n\
+                                    Under voice ≈ -28 LUFS keeps music/SFX beds clearly behind dialogue.\n\
+                                    Boosts are capped so peaks stay under -1 dBFS.";
+                        for (label, target) in [("Under voice", BED_TARGET), ("YouTube", YT_TARGET)] {
+                            if let Some((gain, limited)) = analysis::gain_to(lufs, peak, target) {
+                                let suffix = if limited { " (peak-limited)" } else { "" };
+                                let color = if gain < -0.5 { WARN } else if gain > 0.5 { GOOD } else { TEXT };
+                                ui.label(RichText::new(format!("{}{suffix}", fmt_db(gain))).color(color).strong().monospace())
+                                    .on_hover_text(help);
+                                ui.label(RichText::new(format!("{label} ({target:.0} LUFS):")).color(DIM)).on_hover_text(help);
+                                ui.add_space(10.0);
+                            }
+                        }
+                    });
+                }
+            }
+        });
+        ui.add_space(2.0);
+
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let icon = if self.audio.is_playing() { "⏸" } else { "▶" };
@@ -713,21 +825,11 @@ impl App {
                 actions.push(Action::Stop);
             }
 
-            let title = self
-                .audio
-                .current
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Nothing playing".into());
-            let (title_rect, _) = ui.allocate_exact_size(Vec2::new(240.0, 30.0), Sense::hover());
-            cell_text(ui.painter(), title_rect, &title, if self.audio.current.is_some() { TEXT } else { DIM }, false);
-
             let right_w = 250.0;
             let bar_w = (ui.available_width() - right_w).max(80.0);
-            let (bar, resp) = ui.allocate_exact_size(Vec2::new(bar_w, 30.0), Sense::click_and_drag());
-            let pos = self.audio.position().as_secs_f32();
-            let total = self.audio.duration.map(|d| d.as_secs_f32());
+            let (bar, resp) = ui.allocate_exact_size(Vec2::new(bar_w, 48.0), Sense::click_and_drag());
+            let pos = if live { self.audio.position().as_secs_f32() } else { 0.0 };
+            let total = if live { self.audio.duration.map(|d| d.as_secs_f32()) } else { None };
             let mut frac = total.filter(|t| *t > 0.0).map(|t| (pos / t).clamp(0.0, 1.0)).unwrap_or(0.0);
             if let Some(p) = resp.interact_pointer_pos() {
                 let f = ((p.x - bar.left()) / bar.width()).clamp(0.0, 1.0);
@@ -737,17 +839,13 @@ impl App {
             if (resp.drag_stopped() || resp.clicked())
                 && let Some(f) = self.seek_drag.take()
             {
+                // Clicking the waveform of a file that isn't playing starts it from there.
+                if !live && let Some(idx) = shown {
+                    actions.push(Action::Play(idx));
+                }
                 actions.push(Action::Seek(f));
             }
-            let track = Rect::from_center_size(bar.center(), Vec2::new(bar.width(), 6.0));
-            let painter = ui.painter();
-            painter.rect_filled(track, CornerRadius::same(3), HOVER);
-            let mut done = track;
-            done.set_width(track.width() * frac);
-            painter.rect_filled(done, CornerRadius::same(3), ACCENT);
-            if resp.hovered() || resp.dragged() {
-                painter.circle_filled(egui::pos2(done.right(), track.center().y), 6.0, TEXT);
-            }
+            draw_waveform(ui.painter(), bar, wave.as_deref(), frac, resp.hovered() || resp.dragged());
 
             let time = match total {
                 Some(t) => format!("{} / {}", fmt_duration(pos.min(t)), fmt_duration(t)),
@@ -785,6 +883,10 @@ impl App {
                     self.scanner.probed.load(std::sync::atomic::Ordering::Relaxed),
                     self.entries.len()
                 ));
+            }
+            let pending = self.analyzer.pending();
+            if pending > 0 && !self.scanning {
+                parts.push(format!("measuring loudness… {pending} left"));
             }
             ui.label(RichText::new(parts.join("  ·  ")).small().color(DIM));
             if let Some(m) = &self.message {
@@ -908,19 +1010,75 @@ fn tree_ui(ui: &mut egui::Ui, nodes: &[DirNode], id: usize, selected: &Option<Pa
     }
 }
 
-/// Column rects for a row: Name | Folder | Length | Type | Size.
-fn columns(row: Rect) -> [Rect; 5] {
+/// Column rects for a row: Name | Folder | LUFS | Length | Type | Size.
+fn columns(row: Rect) -> [Rect; 6] {
     const PAD: f32 = 10.0;
-    let fixed = [64.0, 52.0, 74.0];
+    let fixed = [56.0, 64.0, 52.0, 74.0];
     let x0 = row.left() + 6.0;
-    let flex = (row.right() - 6.0 - x0 - fixed.iter().sum::<f32>() - PAD * 4.0).max(120.0);
-    let widths = [flex * 0.55, flex * 0.45, fixed[0], fixed[1], fixed[2]];
+    let flex = (row.right() - 6.0 - x0 - fixed.iter().sum::<f32>() - PAD * 5.0).max(120.0);
+    let widths = [flex * 0.55, flex * 0.45, fixed[0], fixed[1], fixed[2], fixed[3]];
     let mut x = x0;
     widths.map(|w| {
         let r = Rect::from_min_max(egui::pos2(x, row.top()), egui::pos2(x + w, row.bottom()));
         x += w + PAD;
         r
     })
+}
+
+/// Text + color for a LUFS value: hot files (louder than YouTube's target) stand out.
+fn loudness_label(lufs: f32) -> (String, Color32) {
+    if lufs.is_nan() {
+        ("?".into(), DIM)
+    } else if !lufs.is_finite() {
+        ("silent".into(), DIM)
+    } else if lufs > -9.0 {
+        (format!("{lufs:.1}"), HOT)
+    } else if lufs > YT_TARGET + 0.5 {
+        (format!("{lufs:.1}"), WARN)
+    } else {
+        (format!("{lufs:.1}"), DIM)
+    }
+}
+
+fn draw_waveform(painter: &egui::Painter, rect: Rect, wave: Option<&[u8]>, frac: f32, hot: bool) {
+    painter.rect_filled(rect, CornerRadius::same(4), ROW_ALT);
+    let mid = rect.center().y;
+    let play_x = rect.left() + rect.width() * frac;
+    match wave.filter(|w| !w.is_empty()) {
+        Some(wave) => {
+            let half = rect.height() / 2.0 - 3.0;
+            let step = 3.0;
+            let bars = (rect.width() / step).floor().max(1.0) as usize;
+            for b in 0..bars {
+                let x = rect.left() + b as f32 * step + 1.0;
+                let lo = b * wave.len() / bars;
+                let hi = ((b + 1) * wave.len() / bars).max(lo + 1).min(wave.len());
+                let amp = wave[lo..hi].iter().copied().max().unwrap_or(0) as f32 / 255.0;
+                let h = (amp * half).max(0.75);
+                let color = if amp >= 0.99 {
+                    HOT
+                } else if x <= play_x {
+                    ACCENT
+                } else {
+                    Color32::from_rgb(88, 94, 106)
+                };
+                painter.line_segment([egui::pos2(x, mid - h), egui::pos2(x, mid + h)], Stroke::new(2.0, color));
+            }
+        }
+        None => {
+            let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), 4.0));
+            painter.rect_filled(track, CornerRadius::same(2), HOVER);
+            let mut done = track;
+            done.set_width(track.width() * frac);
+            painter.rect_filled(done, CornerRadius::same(2), ACCENT);
+        }
+    }
+    if frac > 0.0 || hot {
+        painter.line_segment(
+            [egui::pos2(play_x, rect.top() + 2.0), egui::pos2(play_x, rect.bottom() - 2.0)],
+            Stroke::new(1.5, TEXT),
+        );
+    }
 }
 
 fn cell_text(painter: &egui::Painter, cell: Rect, text: &str, color: Color32, right: bool) {
