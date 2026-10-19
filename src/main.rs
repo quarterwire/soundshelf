@@ -17,7 +17,8 @@ fn main() -> eframe::Result {
             .with_title("SoundShelf")
             .with_inner_size([1180.0, 720.0])
             .with_min_inner_size([640.0, 320.0])
-            .with_drag_and_drop(true),
+            .with_drag_and_drop(true)
+            .with_icon(egui::IconData { rgba: include_bytes!("../assets/icon-64.rgba").to_vec(), width: 64, height: 64 }),
         ..Default::default()
     };
     eframe::run_native("SoundShelf", options, Box::new(|cc| Ok(Box::new(app::App::new(cc)))))

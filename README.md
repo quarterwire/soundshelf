@@ -8,11 +8,15 @@ Grab the latest `SoundShelf-…-windows-x64.exe` from [Releases](https://github.
 
 ## Build
 
+Double-click `build.bat`, or run:
+
 ```powershell
-cargo build --release
+.\build.ps1
 ```
 
-The binary is at `target\release\soundshelf.exe`.
+This builds `SoundShelf.exe` into the project folder and adds a Start menu shortcut, so it appears when you search "SoundShelf" in Windows. Run it again after pulling changes; it closes a running copy before replacing it. `.\build.ps1 -NoShortcut` skips the shortcut.
+
+Plain `cargo build --release` also works, and puts the exe at `target\release\soundshelf.exe`. The icon and version info are embedded with MinGW's `windres`. Without it, the build still succeeds but the exe has no icon.
 
 ## Use
 
