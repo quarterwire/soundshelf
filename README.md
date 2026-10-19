@@ -27,6 +27,7 @@ The binary is at `target\release\soundshelf.exe`, a single 8 MB file with no ins
 - Videos already downloaded are skipped, so running the same playlist again only grabs new uploads.
 - SoundShelf uses [yt-dlp](https://github.com/yt-dlp/yt-dlp). On first use it downloads `yt-dlp.exe` into `%APPDATA%\SoundShelf\bin` and updates it before each run. ffmpeg isn't needed.
 - Only download audio you have the rights to use, such as your own uploads or royalty-free and Creative Commons music.
+- If something fails, the full output of the last run is in `%APPDATA%\SoundShelf\youtube-download.log`.
 
 ## Loudness
 

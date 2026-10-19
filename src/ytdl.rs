@@ -2,12 +2,95 @@
 //! yt-dlp is fetched into %APPDATA%\SoundShelf\bin on first use and self-updated before each run.
 //! Audio is saved as the original m4a stream, so ffmpeg isn't needed.
 
-use std::io::{BufRead, BufReader};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
+
+/// yt-dlp.exe re-launches itself as a child process, so killing the process we spawned isn't
+/// enough. Every process we start goes into a job that dies with it (and with SoundShelf).
+#[cfg(windows)]
+struct Job(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for Job {}
+#[cfg(windows)]
+unsafe impl Sync for Job {}
+
+#[cfg(windows)]
+impl Job {
+    fn new() -> Self {
+        use windows::Win32::System::JobObjects::*;
+        unsafe {
+            let job = CreateJobObjectW(None, windows::core::PCWSTR::null()).unwrap_or_default();
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let _ = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of_val(&info) as u32,
+            );
+            Self(job)
+        }
+    }
+
+    fn adopt(&self, child: &Child) {
+        use std::os::windows::io::AsRawHandle;
+        let process = windows::Win32::Foundation::HANDLE(child.as_raw_handle());
+        unsafe {
+            let _ = windows::Win32::System::JobObjects::AssignProcessToJobObject(self.0, process);
+        }
+    }
+
+    fn kill(&self) {
+        unsafe {
+            let _ = windows::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct Job;
+
+#[cfg(not(windows))]
+impl Job {
+    fn new() -> Self {
+        Job
+    }
+    fn adopt(&self, _child: &Child) {}
+    fn kill(&self) {}
+}
+
+/// Reads lines until EOF, replacing invalid UTF-8 instead of stopping. Stopping early would close
+/// the pipe and make yt-dlp die with "[Errno 22] Invalid argument" on its next write.
+fn lines_lossy(r: impl std::io::Read) -> impl Iterator<Item = String> {
+    let mut r = BufReader::new(r);
+    std::iter::from_fn(move || {
+        let mut buf = Vec::new();
+        match r.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_owned()),
+        }
+    })
+}
+
+pub fn log_path() -> Option<PathBuf> {
+    let base = std::env::var_os("APPDATA")?;
+    Some(PathBuf::from(base).join("SoundShelf").join("youtube-download.log"))
+}
 
 const YTDLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
 
@@ -23,30 +106,34 @@ pub enum Event {
 
 pub struct Download {
     pub rx: Receiver<Event>,
-    child: Arc<Mutex<Option<Child>>>,
+    job: Arc<Job>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl Download {
     pub fn start(url: String, dest: PathBuf, ctx: eframe::egui::Context) -> Self {
         let (tx, rx) = channel();
-        let child = Arc::new(Mutex::new(None));
+        let job = Arc::new(Job::new());
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (c, k) = (child.clone(), cancelled.clone());
+        let (j, k) = (job.clone(), cancelled.clone());
         std::thread::spawn(move || {
-            let result = run(&url, &dest, &tx, &c, &k, &ctx);
+            let result = run(&url, &dest, &tx, &j, &k, &ctx);
             let result = if k.load(Ordering::Relaxed) { Err("Cancelled".into()) } else { result };
             let _ = tx.send(Event::Finished(result));
             ctx.request_repaint();
         });
-        Self { rx, child, cancelled }
+        Self { rx, job, cancelled }
     }
 
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
-        if let Some(c) = self.child.lock().unwrap().as_mut() {
-            let _ = c.kill();
-        }
+        self.job.kill();
+    }
+}
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        self.cancel();
     }
 }
 
@@ -99,7 +186,7 @@ fn run(
     url: &str,
     dest: &Path,
     tx: &Sender<Event>,
-    child_slot: &Arc<Mutex<Option<Child>>>,
+    job: &Job,
     cancelled: &AtomicBool,
     ctx: &eframe::egui::Context,
 ) -> Result<(), String> {
@@ -112,7 +199,13 @@ fn run(
 
     let template = dest.join("%(playlist_title,uploader|YouTube)s").join("%(title)s.%(ext)s");
     let mut child = command(&ytdlp)
-        .args(["-f", "bestaudio[ext=m4a]/bestaudio", "--ignore-errors", "--newline", "--no-part", "--color", "never"])
+        // Downloads go to .part files until complete, so a cancelled one never leaves a broken .m4a
+        // in the library (the scanner ignores .part).
+        .args(["-f", "bestaudio[ext=m4a]/bestaudio", "--ignore-errors", "--newline", "--color", "never"])
+        // The frozen yt-dlp.exe ignores PYTHONUTF8 and would otherwise print in the ANSI code page.
+        .args(["--encoding", "utf-8"])
+        // --print below implies --quiet, which would hide the progress and "item N of M" lines we parse.
+        .args(["--no-quiet", "--progress"])
         // Skip anything already downloaded, so re-running a playlist only fetches new videos.
         .arg("--download-archive")
         .arg(dest.join(".soundshelf-archive.txt"))
@@ -126,23 +219,41 @@ fn run(
         .spawn()
         .map_err(|e| format!("couldn't start yt-dlp: {e}"))?;
 
+    job.adopt(&child);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    *child_slot.lock().unwrap() = Some(child);
+
+    // Full yt-dlp output, for troubleshooting failed downloads.
+    let log = Arc::new(Mutex::new(log_path().and_then(|p| File::create(p).ok())));
+    let write_log = {
+        let log = log.clone();
+        move |line: &str| {
+            if let Some(f) = log.lock().unwrap().as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+    };
 
     let err_tx = tx.clone();
     let err_lines = Arc::new(Mutex::new(Vec::<String>::new()));
     let err_keep = err_lines.clone();
+    let err_log = write_log.clone();
     let err_thread = std::thread::spawn(move || {
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        for line in lines_lossy(stderr) {
+            err_log(&line);
             if line.starts_with("ERROR") {
                 err_keep.lock().unwrap().push(line.clone());
             }
-            let _ = err_tx.send(Event::Line(line));
+            if !line.starts_with("WARNING") {
+                let _ = err_tx.send(Event::Line(line));
+            }
         }
     });
 
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+    for line in lines_lossy(stdout) {
+        if !line.starts_with("SSPROG") {
+            write_log(&line);
+        }
         if let Some(p) = line.strip_prefix("SSPROG") {
             if let Ok(v) = p.trim().trim_end_matches('%').trim().parse::<f32>() {
                 let _ = tx.send(Event::Percent(v));
@@ -162,19 +273,17 @@ fn run(
     }
     let _ = err_thread.join();
 
-    let status = child_slot.lock().unwrap().take().map(|mut c| c.wait());
-    match status {
-        Some(Ok(s)) if s.success() => Ok(()),
+    match child.wait() {
+        Ok(s) if s.success() => Ok(()),
         // With --ignore-errors yt-dlp exits 1 if some videos failed (private, removed…).
-        Some(Ok(_)) => {
+        Ok(_) => {
             let errs = err_lines.lock().unwrap();
             match errs.len() {
                 0 => Err("yt-dlp reported an error".into()),
                 n => Err(format!("{n} item(s) failed — last: {}", errs.last().unwrap())),
             }
         }
-        Some(Err(e)) => Err(e.to_string()),
-        None => Ok(()),
+        Err(e) => Err(e.to_string()),
     }
 }
 

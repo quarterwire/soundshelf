@@ -857,7 +857,16 @@ impl App {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             let title = entry.map(|e| e.name.clone()).unwrap_or_else(|| "Nothing selected".into());
-            ui.label(RichText::new(title).color(if entry.is_some() { TEXT } else { DIM }).strong());
+            // Leave room for the loudness readout and gain advice on the right.
+            let title_w = (ui.available_width() - 760.0).max(160.0);
+            ui.scope(|ui| {
+                ui.set_max_width(title_w);
+                ui.add(
+                    egui::Label::new(RichText::new(&title).color(if entry.is_some() { TEXT } else { DIM }).strong())
+                        .truncate(),
+                )
+                .on_hover_text(&title);
+            });
             let Some(e) = entry else { return };
             match e.loudness {
                 None => {
@@ -1004,8 +1013,10 @@ impl App {
         egui::Window::new("Download from YouTube").open(&mut open).default_width(540.0).collapsible(false).show(ctx, |ui| {
             ui.label("Paste a YouTube video or playlist link. Audio is saved as .m4a, one folder per playlist.");
             ui.add_space(4.0);
+            // The horizontal wrapper keeps the right-to-left row one line tall;
+            // on its own it would claim all the remaining height of the window.
             let edit = ui
-                .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                .horizontal(|ui| ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.add_enabled(!running, egui::Button::new("Paste")).on_hover_text("Paste link from clipboard").clicked()
                         && let Some(text) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok())
                     {
@@ -1017,18 +1028,20 @@ impl App {
                             .hint_text("https://www.youtube.com/playlist?list=…")
                             .desired_width(f32::INFINITY),
                     )
-                })
+                }).inner)
                 .inner;
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Save to").color(DIM));
-                ui.label(RichText::new(dest.display().to_string()).monospace());
                 if ui.add_enabled(!running, egui::Button::new("Change…").small()).clicked()
                     && let Some(dir) = rfd::FileDialog::new().set_title("Save YouTube downloads to").pick_folder()
                 {
                     self.cfg.download_dir = Some(dir);
                     self.cfg.save();
                 }
+                // Long paths are cut short instead of stretching the window.
+                ui.add(egui::Label::new(RichText::new(dest.display().to_string()).monospace()).truncate())
+                    .on_hover_text(dest.display().to_string());
             });
             ui.label(
                 RichText::new("Videos already downloaded are skipped, so re-run a playlist to grab only the new ones.")
@@ -1210,12 +1223,13 @@ fn tree_ui(
     let mut job = LayoutJob::default();
     let normal = egui::TextFormat { font_id: FontId::proportional(13.5), color: TEXT, ..Default::default() };
     let dim = egui::TextFormat { font_id: FontId::proportional(11.5), color: DIM, ..Default::default() };
-    job.append(&node.name, 0.0, normal);
-    job.append(&node.count.to_string(), 8.0, dim);
+    // Mark tag goes first so truncating a long folder name can't hide it.
     if let Some(&is_sfx) = marks.get(&node.path) {
         let tag = egui::TextFormat { font_id: FontId::proportional(11.0), color: ACCENT, ..Default::default() };
-        job.append(if is_sfx { "SFX" } else { "Music" }, 8.0, tag);
+        job.append(if is_sfx { "SFX " } else { "Music " }, 0.0, tag);
     }
+    job.append(&node.name, 0.0, normal);
+    job.append(&node.count.to_string(), 8.0, dim);
 
     let mut label = |ui: &mut egui::Ui| {
         let resp = ui.add(egui::Button::selectable(is_sel, job.clone()).wrap_mode(TextWrapMode::Truncate));
