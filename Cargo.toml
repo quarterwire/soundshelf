@@ -1,0 +1,33 @@
+[package]
+name = "soundshelf"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, lightweight audio library for songs and SFX with drag-and-drop into Premiere"
+
+[dependencies]
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts"] }
+egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "flac", "mp3", "mp4", "vorbis", "wav", "symphonia-aiff", "symphonia-pcm"] }
+rfd = { version = "0.17.2", default-features = false }
+walkdir = "2.5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
+windows-core = "0.62"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+
+# Decoding in debug builds is painfully slow; optimize deps even in dev.
+[profile.dev.package."*"]
+opt-level = 2
