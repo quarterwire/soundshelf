@@ -12,6 +12,20 @@ use crate::audio::Audio;
 use crate::config::Config;
 use crate::dragout;
 use crate::library::{self, DirNode, Entry, Msg, Scanner, fmt_duration, fmt_size};
+use crate::ytdl::{self, Download};
+
+#[derive(Default)]
+struct DlState {
+    open: bool,
+    url: String,
+    job: Option<Download>,
+    status: String,
+    item: Option<(u32, u32)>,
+    percent: f32,
+    saved: u32,
+    last_line: String,
+    result: Option<Result<(), String>>,
+}
 
 const ROW_H: f32 = 22.0;
 /// Clips shorter than this count as SFX, longer as music.
@@ -96,6 +110,7 @@ pub struct App {
     seek_drag: Option<f32>,
     analyzer: Analyzer,
     cache: Cache,
+    dl: DlState,
     /// Set after an OS drag: the button-up went to the drop target, so egui never saw it.
     release_pointer: bool,
     message: Option<String>,
@@ -134,6 +149,7 @@ impl App {
             seek_drag: None,
             analyzer: Analyzer::new(cc.egui_ctx.clone()),
             cache: Cache::load(),
+            dl: DlState::default(),
             release_pointer: false,
             message: None,
         };
@@ -581,6 +597,10 @@ impl App {
                 if ui.button("⟳ Rescan").on_hover_text("F5").clicked() {
                     actions.push(Action::Rescan);
                 }
+                let label = if self.dl.job.is_some() { "YouTube (downloading…)" } else { "Download from YouTube" };
+                if ui.button(label).clicked() {
+                    self.dl.open = true;
+                }
                 if ui
                     .checkbox(&mut self.cfg.autoplay, "Play on select")
                     .on_hover_text("Preview a sound as soon as you click it or arrow onto it")
@@ -866,6 +886,142 @@ impl App {
         });
     }
 
+    fn download_dir(&self) -> PathBuf {
+        if let Some(d) = &self.cfg.download_dir {
+            return d.clone();
+        }
+        if let Some(root) = self.cfg.roots.first() {
+            return root.join("YouTube");
+        }
+        let home = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_default();
+        home.join("Music").join("SoundShelf")
+    }
+
+    fn poll_download(&mut self, ctx: &egui::Context) {
+        let Some(job) = &self.dl.job else { return };
+        let events: Vec<ytdl::Event> = job.rx.try_iter().collect();
+        for ev in events {
+            match ev {
+                ytdl::Event::Status(s) => self.dl.status = s,
+                ytdl::Event::Item(a, b) => {
+                    self.dl.item = Some((a, b));
+                    self.dl.percent = 0.0;
+                }
+                ytdl::Event::Percent(p) => {
+                    self.dl.percent = p;
+                    self.dl.status = "Downloading".into();
+                }
+                ytdl::Event::Saved(path) => {
+                    self.dl.saved += 1;
+                    let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().into_owned());
+                    self.dl.last_line = format!("Saved {}", name.unwrap_or(path));
+                }
+                ytdl::Event::Line(l) => {
+                    if !l.trim().is_empty() {
+                        self.dl.last_line = l;
+                    }
+                }
+                ytdl::Event::Finished(r) => {
+                    self.dl.job = None;
+                    self.dl.result = Some(r);
+                    if self.dl.saved > 0 {
+                        let dir = self.download_dir();
+                        if self.cfg.roots.iter().any(|r| dir.starts_with(r)) {
+                            self.rescan(ctx);
+                        } else {
+                            self.add_roots(ctx, vec![dir]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn ui_download(&mut self, ctx: &egui::Context) {
+        if !self.dl.open {
+            return;
+        }
+        let mut open = true;
+        let dest = self.download_dir();
+        let running = self.dl.job.is_some();
+        egui::Window::new("Download from YouTube").open(&mut open).default_width(540.0).collapsible(false).show(ctx, |ui| {
+            ui.label("Paste a YouTube video or playlist link. Audio is saved as .m4a, one folder per playlist.");
+            ui.add_space(4.0);
+            let edit = ui.add_enabled(
+                !running,
+                egui::TextEdit::singleline(&mut self.dl.url)
+                    .hint_text("https://www.youtube.com/playlist?list=…")
+                    .desired_width(f32::INFINITY),
+            );
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Save to").color(DIM));
+                ui.label(RichText::new(dest.display().to_string()).monospace());
+                if ui.add_enabled(!running, egui::Button::new("Change…").small()).clicked()
+                    && let Some(dir) = rfd::FileDialog::new().set_title("Save YouTube downloads to").pick_folder()
+                {
+                    self.cfg.download_dir = Some(dir);
+                    self.cfg.save();
+                }
+            });
+            ui.label(
+                RichText::new("Videos already downloaded are skipped, so re-run a playlist to grab only the new ones.")
+                    .small()
+                    .color(DIM),
+            );
+            ui.label(RichText::new("Only download audio you have the rights to use.").small().color(DIM));
+            ui.add_space(6.0);
+
+            if running {
+                let mut status = self.dl.status.clone();
+                if let Some((a, b)) = self.dl.item {
+                    status = format!("{status}  ·  item {a} of {b}");
+                }
+                ui.label(status);
+                ui.add(egui::ProgressBar::new(self.dl.percent / 100.0).show_percentage());
+                if self.dl.saved > 0 {
+                    ui.label(RichText::new(format!("{} saved so far", self.dl.saved)).small().color(DIM));
+                }
+                if !self.dl.last_line.is_empty() {
+                    ui.add(egui::Label::new(RichText::new(&self.dl.last_line).small().color(DIM)).truncate());
+                }
+                if ui.button("Cancel").clicked()
+                    && let Some(job) = &self.dl.job
+                {
+                    job.cancel();
+                }
+            } else {
+                let can = !self.dl.url.trim().is_empty();
+                let go = ui.add_enabled(can, egui::Button::new("Download")).clicked() || (enter && can);
+                match &self.dl.result {
+                    Some(Ok(())) if self.dl.saved == 0 => {
+                        ui.label(RichText::new("Nothing new — everything here is already downloaded.").color(GOOD));
+                    }
+                    Some(Ok(())) => {
+                        ui.label(RichText::new(format!("Done — {} file(s) added to your library.", self.dl.saved)).color(GOOD));
+                    }
+                    Some(Err(e)) => {
+                        if self.dl.saved > 0 {
+                            ui.label(RichText::new(format!("{} file(s) saved.", self.dl.saved)).color(GOOD));
+                        }
+                        ui.add(egui::Label::new(RichText::new(e).color(WARN)).wrap());
+                    }
+                    None => {}
+                }
+                if go {
+                    self.dl = DlState {
+                        open: true,
+                        url: self.dl.url.trim().to_owned(),
+                        status: "Preparing…".into(),
+                        ..Default::default()
+                    };
+                    self.dl.job = Some(Download::start(self.dl.url.clone(), dest.clone(), ctx.clone()));
+                }
+            }
+        });
+        self.dl.open = open;
+    }
+
     fn ui_status(&self, ui: &mut egui::Ui) {
         ui.horizontal_centered(|ui| {
             let mut parts = vec![format!("{} sounds", self.entries.len())];
@@ -919,6 +1075,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll();
+        self.poll_download(&ctx);
 
         let dropped: Vec<PathBuf> =
             ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| p.is_dir()).collect());
@@ -961,6 +1118,8 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(6, 4)))
             .show(ui, |ui| self.ui_list(ui, &mut actions));
+
+        self.ui_download(&ctx);
 
         for action in actions {
             self.apply(&ctx, action);

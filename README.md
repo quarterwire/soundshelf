@@ -20,6 +20,14 @@ The binary is at `target\release\soundshelf.exe`, a single 8 MB file with no ins
 - **Space** play/pause · **Left/Right** seek 5 s · **Esc** stop or clear search · **F5** rescan
 - **SFX / Music** split clips at 30 seconds.
 
+## YouTube downloads
+
+**Download from YouTube** (top bar) takes a video or playlist link and saves the audio as `.m4a`, in one folder per playlist, inside your download folder. The download folder defaults to `<first library folder>\YouTube`, and you can change it with **Change…**. New files appear in the library when the download finishes.
+
+- Videos already downloaded are skipped, so running the same playlist again only grabs new uploads.
+- SoundShelf uses [yt-dlp](https://github.com/yt-dlp/yt-dlp). On first use it downloads `yt-dlp.exe` into `%APPDATA%\SoundShelf\bin` and updates it before each run. ffmpeg isn't needed.
+- Only download audio you have the rights to use, such as your own uploads or royalty-free and Creative Commons music.
+
 ## Loudness
 
 Every file is measured in the background using integrated loudness (LUFS, ITU-R BS.1770 / EBU R128), the same method YouTube uses. Results are cached, so each file is only measured once. The selected file is measured first.

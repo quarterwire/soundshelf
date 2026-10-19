@@ -6,6 +6,7 @@ mod audio;
 mod config;
 mod dragout;
 mod library;
+mod ytdl;
 
 use eframe::egui;
 

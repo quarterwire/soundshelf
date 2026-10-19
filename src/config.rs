@@ -5,11 +5,12 @@ pub struct Config {
     pub roots: Vec<PathBuf>,
     pub volume: f32,
     pub autoplay: bool,
+    pub download_dir: Option<PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { roots: Vec::new(), volume: 0.8, autoplay: true }
+        Self { roots: Vec::new(), volume: 0.8, autoplay: true, download_dir: None }
     }
 }
 
@@ -28,6 +29,7 @@ impl Config {
                 "root" => cfg.roots.push(PathBuf::from(value.trim())),
                 "volume" => cfg.volume = value.trim().parse().unwrap_or(cfg.volume),
                 "autoplay" => cfg.autoplay = value.trim() == "1",
+                "download_dir" => cfg.download_dir = Some(PathBuf::from(value.trim())),
                 _ => {}
             }
         }
@@ -37,6 +39,9 @@ impl Config {
     pub fn save(&self) {
         let Some(path) = path() else { return };
         let mut out = format!("volume={}\nautoplay={}\n", self.volume, if self.autoplay { 1 } else { 0 });
+        if let Some(dir) = &self.download_dir {
+            out.push_str(&format!("download_dir={}\n", dir.display()));
+        }
         for root in &self.roots {
             out.push_str(&format!("root={}\n", root.display()));
         }
