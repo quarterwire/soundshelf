@@ -1,6 +1,6 @@
 [package]
 name = "soundshelf"
-version = "0.5.0-beta.1"
+version = "0.5.1-beta.1"
 edition = "2024"
 description = "Fast, lightweight audio library for songs and SFX with drag-and-drop into Premiere"
 
@@ -11,6 +11,7 @@ egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 rodio = { version = "0.23.0", default-features = false, features = ["playback", "flac", "mp3", "mp4", "vorbis", "wav", "symphonia-aiff", "symphonia-pcm"] }
 rfd = { version = "0.17.2", default-features = false }
 walkdir = "2.5"
+symphonia = { version = "0.5.5", default-features = false, features = ["isomp4", "aac"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

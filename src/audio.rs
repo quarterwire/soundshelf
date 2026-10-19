@@ -2,6 +2,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use std::num::NonZero;
+
+use rodio::buffer::SamplesBuffer;
 use rodio::{Decoder, MixerDeviceSink, Player, Source};
 
 /// Preview player. The output device is opened lazily so startup stays instant.
@@ -26,12 +29,24 @@ impl Audio {
             self.sink = Some(sink);
         }
         let sink = self.sink.as_ref().unwrap();
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let decoder = Decoder::try_from(file).map_err(|e| e.to_string())?;
-        self.duration = decoder.total_duration();
         let player = Player::connect_new(sink.mixer());
         player.set_volume(self.volume);
-        player.append(decoder);
+        match crate::multitrack::loudest_track(path) {
+            Some(d) => {
+                let (Some(ch), Some(rate)) = (NonZero::new(d.channels), NonZero::new(d.rate)) else {
+                    return Err("bad audio track".into());
+                };
+                let buffer = SamplesBuffer::new(ch, rate, d.samples);
+                self.duration = buffer.total_duration();
+                player.append(buffer);
+            }
+            None => {
+                let file = File::open(path).map_err(|e| e.to_string())?;
+                let decoder = Decoder::try_from(file).map_err(|e| e.to_string())?;
+                self.duration = decoder.total_duration();
+                player.append(decoder);
+            }
+        }
         self.player = Some(player);
         self.current = Some(path.to_path_buf());
         Ok(())

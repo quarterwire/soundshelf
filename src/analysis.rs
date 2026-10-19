@@ -88,9 +88,18 @@ fn lufs(power: f64) -> f64 {
 }
 
 pub fn analyze(path: &Path) -> Option<Analysis> {
+    // Same track choice as playback, so a file with a silent first track is measured by its real sound.
+    if let Some(d) = crate::multitrack::loudest_track(path) {
+        return Some(measure(d.channels as usize, d.rate as f64, d.samples.into_iter()));
+    }
     let decoder = Decoder::try_from(File::open(path).ok()?).ok()?;
     let channels = decoder.channels().get() as usize;
     let rate = decoder.sample_rate().get() as f64;
+    Some(measure(channels, rate, decoder.map(|s| s as f32)))
+}
+
+fn measure(channels: usize, rate: f64, samples: impl Iterator<Item = f32>) -> Analysis {
+    let channels = channels.max(1);
     let mut filters: Vec<[Biquad; 2]> = (0..channels).map(|_| k_weighting(rate)).collect();
 
     // Mean square per 100 ms segment (summed over channels); 400 ms blocks overlap by 75%.
@@ -107,8 +116,7 @@ pub fn analyze(path: &Path) -> Option<Analysis> {
 
     let mut peak = 0.0f32;
     let mut ch = 0usize;
-    for s in decoder {
-        let s = s as f32;
+    for s in samples {
         let a = s.abs();
         peak = peak.max(a);
         chunk_peak = chunk_peak.max(a);
@@ -166,11 +174,11 @@ pub fn analyze(path: &Path) -> Option<Analysis> {
         })
         .collect();
 
-    Some(Analysis {
+    Analysis {
         lufs: lufs_value as f32,
         peak_db: if peak > 0.0 { 20.0 * peak.log10() } else { f32::NEG_INFINITY },
         wave,
-    })
+    }
 }
 
 // ---------- disk cache ----------
@@ -185,7 +193,8 @@ fn cache_path() -> Option<PathBuf> {
     Some(PathBuf::from(base).join("SoundShelf").join("analysis.bin"))
 }
 
-const MAGIC: &[u8; 8] = b"SSHELF01";
+/// Bumped when measurement changes (02: multi-track files measure their audible track).
+const MAGIC: &[u8; 8] = b"SSHELF02";
 
 impl Cache {
     pub fn load() -> Self {
@@ -197,6 +206,12 @@ impl Cache {
                 while let Some((path, size, mtime, a)) = read_record(&mut r) {
                     map.insert(path, (size, mtime, a));
                     records += 1;
+                }
+            } else {
+                // Old format: start over (appending to it would keep the old header).
+                drop(r);
+                if let Some(p) = cache_path() {
+                    let _ = std::fs::remove_file(p);
                 }
             }
         }

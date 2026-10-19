@@ -47,6 +47,6 @@ Every file is measured in the background using integrated loudness (LUFS, ITU-R 
 
 Settings live in `%APPDATA%\SoundShelf\config.txt`.
 
-Playback supports WAV, MP3, FLAC, OGG, M4A/AAC and AIFF. Opus and WMA files are listed and can be dragged, but they can't be previewed.
+Playback supports WAV, MP3, FLAC, OGG, M4A/AAC (including audio-only MP4) and AIFF. Files with several audio tracks play the track that actually has sound. Opus, WMA, MKV and WebM files are listed and can be dragged, but they can't be previewed.
 
 **Note:** Windows blocks drag-and-drop between an elevated (administrator) app and a normal one. Run SoundShelf and Premiere at the same privilege level.

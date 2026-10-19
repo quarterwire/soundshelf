@@ -6,7 +6,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 use walkdir::WalkDir;
 
-pub const AUDIO_EXTS: &[&str] = &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aif", "aiff", "opus", "wma"];
+/// Video containers are listed too: lots of downloaded SFX are audio-only .mp4, and Premiere takes them all.
+pub const AUDIO_EXTS: &[&str] =
+    &["wav", "mp3", "flac", "ogg", "oga", "m4a", "aac", "aif", "aiff", "opus", "wma", "mp4", "mkv", "webm"];
 
 pub struct Entry {
     pub path: PathBuf,
@@ -112,9 +114,10 @@ fn make_entry(root: &Path, path: &Path, ext: String, size: u64, mtime: u64) -> E
     let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let root_name = root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
+    // Relative to the library folder, so the column shows "SFX/Whooshes" rather than repeating the root.
     let folder = match dir.strip_prefix(root) {
         Ok(rel) if rel.as_os_str().is_empty() => root_name,
-        Ok(rel) => format!("{root_name}/{}", rel.to_string_lossy().replace('\\', "/")),
+        Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
         Err(_) => dir.display().to_string(),
     };
     let haystack = format!("{} {}", name, folder).to_lowercase();
