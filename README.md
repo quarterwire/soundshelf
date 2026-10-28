@@ -22,6 +22,7 @@ Plain `cargo build --release` also works, and puts the exe at `target\release\so
 
 - **+ Add folder**, or drop folders onto the window. Subfolders are included, and the left tree filters by folder.
 - **Type anywhere** to search names and folder paths. Use spaces for multiple words.
+- **🎲 Random** (or **Ctrl+R**) plays a random sound from the list you're looking at, for when you don't know what you want yet. Pick **SFX** or **Music**, a folder, or type a word first to narrow it down, then keep clicking for more. It won't repeat any of your last 30 picks.
 - **Click** or use the **Up/Down** keys to preview. Turn off "Play on select" if you only want playback on Enter or double-click.
 - **Drag** one row, or a Ctrl/Shift multi-selection, into Premiere's timeline or Project panel.
 - **Ctrl+C** copies the files themselves, the same as Explorer does.

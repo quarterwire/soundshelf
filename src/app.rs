@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -30,6 +31,8 @@ struct DlState {
 const ROW_H: f32 = 22.0;
 /// Clips shorter than this count as SFX, longer as music.
 const SFX_MAX_SECS: f32 = 30.0;
+/// Random picks skip this many of the most recent ones (fewer for short lists).
+const RANDOM_MEMORY: usize = 30;
 
 const BG: Color32 = Color32::from_rgb(22, 23, 26);
 const PANEL: Color32 = Color32::from_rgb(30, 31, 35);
@@ -90,6 +93,8 @@ enum Action {
     TogglePause,
     Stop,
     Seek(f32),
+    /// Select and play a random row from the current view.
+    Random,
 }
 
 pub struct App {
@@ -131,6 +136,10 @@ pub struct App {
     /// Set after an OS drag: the button-up went to the drop target, so egui never saw it.
     release_pointer: bool,
     message: Option<String>,
+    /// Entry indices of recent random picks, newest last, so Random doesn't repeat itself.
+    recent_random: VecDeque<usize>,
+    rng: RandomState,
+    rng_counter: u64,
 }
 
 impl App {
@@ -170,12 +179,17 @@ impl App {
             marks: crate::config::load_marks(),
             release_pointer: false,
             message: None,
+            recent_random: VecDeque::new(),
+            rng: RandomState::new(),
+            rng_counter: 0,
         };
         app.rescan(&cc.egui_ctx);
         app
     }
 
     fn rescan(&mut self, ctx: &egui::Context) {
+        // Entry indices change with a new scan.
+        self.recent_random.clear();
         self.cfg.roots.retain(|r| r.is_dir());
         if self.cfg.roots.is_empty() {
             self.entries.clear();
@@ -352,6 +366,44 @@ impl App {
         }
     }
 
+    /// Random number in 0..n (n > 0). RandomState is seeded randomly per process.
+    fn random_below(&mut self, n: usize) -> usize {
+        self.rng_counter = self.rng_counter.wrapping_add(1);
+        let mut h = self.rng.build_hasher();
+        h.write_u64(self.rng_counter);
+        (h.finish() % n as u64) as usize
+    }
+
+    /// Selects and plays a random row from the current view (so the SFX/Music tab,
+    /// search and folder all narrow it), skipping recent picks.
+    fn pick_random(&mut self) {
+        if self.view.is_empty() {
+            self.message = Some("Nothing to pick from: clear the search or pick another folder.".into());
+            return;
+        }
+        let memory = RANDOM_MEMORY.min(self.view.len() / 2);
+        while self.recent_random.len() > memory {
+            self.recent_random.pop_front();
+        }
+        let mut pos = self.random_below(self.view.len());
+        for _ in 0..64 {
+            if !self.recent_random.contains(&self.view[pos]) {
+                break;
+            }
+            pos = self.random_below(self.view.len());
+        }
+        let idx = self.view[pos];
+        if memory > 0 {
+            self.recent_random.push_back(idx);
+        }
+        self.selected.clear();
+        self.selected.insert(idx);
+        self.anchor = Some(idx);
+        self.cursor = Some(idx);
+        self.scroll_to_cursor = true;
+        self.play(idx);
+    }
+
     fn select_range_to(&mut self, pos: usize) {
         let anchor = self.anchor.and_then(|a| self.view.iter().position(|&i| i == a)).unwrap_or(pos);
         let (lo, hi) = if anchor <= pos { (anchor, pos) } else { (pos, anchor) };
@@ -472,6 +524,7 @@ impl App {
                 }
             }
             Action::Stop => self.audio.stop(),
+            Action::Random => self.pick_random(),
             Action::Seek(frac) => {
                 if let Some(d) = self.audio.duration {
                     self.audio.seek(d.mul_f32(frac.clamp(0.0, 1.0)));
@@ -529,6 +582,9 @@ impl App {
             }
             if i.consume_key(Modifiers::COMMAND, Key::F) {
                 self.focus_search = true;
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::R) {
+                actions.push(Action::Random);
             }
             if i.consume_key(Modifiers::NONE, Key::F5) {
                 actions.push(Action::Rescan);
@@ -642,6 +698,17 @@ impl App {
                     self.kind = kind;
                     self.view_dirty = true;
                 }
+            }
+            ui.add_space(6.0);
+            if ui
+                .button("🎲 Random")
+                .on_hover_text(
+                    "Play a random sound from the list shown (Ctrl+R). Pick SFX or Music, a folder, \
+                     or type a word first to narrow it down. Click again for another.",
+                )
+                .clicked()
+            {
+                actions.push(Action::Random);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("⟳ Rescan").on_hover_text("F5").clicked() {
@@ -1126,7 +1193,7 @@ impl App {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new("Drag rows into Premiere  ·  Space play/pause  ·  Up/Down browse  ·  Left/Right seek  ·  Ctrl+C copy file")
+                    RichText::new("Drag rows into Premiere  ·  Space play/pause  ·  Up/Down browse  ·  Left/Right seek  ·  Ctrl+R random  ·  Ctrl+C copy file")
                         .small()
                         .color(DIM),
                 );
